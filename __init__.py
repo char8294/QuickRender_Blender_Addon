@@ -12,7 +12,7 @@ import bpy
 import os
 import re
 from datetime import datetime
-from bpy.props import StringProperty, EnumProperty, IntProperty, BoolProperty, PointerProperty
+from bpy.props import StringProperty, EnumProperty, IntProperty, BoolProperty, PointerProperty, FloatVectorProperty
 from bpy.types import Panel, Operator, PropertyGroup
 from mathutils import Vector
 
@@ -281,6 +281,20 @@ class QVR_Props(PropertyGroup):
         default='Standard'
     )
 
+    # --- Batch Set Location ---
+    batch_set_location: BoolProperty(
+        name="Set Location Object",
+        description="ย้าย object ไปยังตำแหน่งที่กำหนดก่อน render แล้วคืนค่าหลัง batch เสร็จ",
+        default=False
+    )
+    batch_location: FloatVectorProperty(
+        name="Location",
+        description="ตำแหน่งที่จะย้าย object ไปก่อน render",
+        subtype='TRANSLATION',
+        default=(0.0, 0.0, 0.0),
+        size=3
+    )
+
 # -------------------- Core Render Routine --------------------
 def render_core(context, *, save_file: bool, batch_objects=None):
     scene = context.scene
@@ -450,21 +464,44 @@ class QVR_OT_batch_render_selected(Operator):
         ext = apply_render_size_and_format(scene, props)
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S") if props.batch_timestamp else ""
 
+        # เก็บ location เดิมของทุก object ที่เลือก (ถ้าเปิด Set Location)
+        original_locations = {}
+        if props.batch_set_location:
+            for obj in sel:
+                original_locations[obj.name] = obj.location.copy()
+
         rendered = 0
-        for obj in sel:
-            safe = sanitize_name(obj.name)
-            # สร้างชื่อ: prefix + ObjName + suffix + timestamp
-            name = props.batch_prefix + safe
-            if props.batch_suffix:
-                name += "_" + props.batch_suffix
-            if ts:
-                name += "_" + ts
-            scene.render.filepath = os.path.join(out_dir, name + ext)
-            try:
-                render_core(context, save_file=True, batch_objects=[obj])
-                rendered += 1
-            except Exception as e:
-                self.report({'WARNING'}, f"ข้าม {obj.name}: {e}")
+        try:
+            for obj in sel:
+                # ย้าย object ไปยังตำแหน่งที่กำหนด
+                if props.batch_set_location:
+                    obj.location = Vector(props.batch_location)
+
+                safe = sanitize_name(obj.name)
+                # สร้างชื่อ: prefix + ObjName + suffix + timestamp
+                name = props.batch_prefix + safe
+                if props.batch_suffix:
+                    name += "_" + props.batch_suffix
+                if ts:
+                    name += "_" + ts
+                scene.render.filepath = os.path.join(out_dir, name + ext)
+                try:
+                    render_core(context, save_file=True, batch_objects=[obj])
+                    rendered += 1
+                except Exception as e:
+                    self.report({'WARNING'}, f"ข้าม {obj.name}: {e}")
+                finally:
+                    # คืน location เดิมของ object ชิ้นนี้ทันทีหลัง render เสร็จ
+                    if props.batch_set_location and obj.name in original_locations:
+                        obj.location = original_locations[obj.name]
+        except Exception as e:
+            # กรณีเกิด error ไม่คาดคิด -> คืน location ทั้งหมดที่ยังไม่ได้คืน
+            if props.batch_set_location:
+                for obj_name, loc in original_locations.items():
+                    o = scene.objects.get(obj_name)
+                    if o:
+                        o.location = loc
+            raise
 
         if rendered:
             self.report({'INFO'}, f"เสร็จ {rendered} ไฟล์")
@@ -572,6 +609,13 @@ class QVR_PT_panel(Panel):
         row.alignment = 'LEFT'
         row.scale_y = 0.7
         row.label(text=f"  → {props.batch_prefix}[ObjName]{sfx}{ts_b}{ext}", icon='INFO')
+
+        # ── Set Location Object ──
+        box.separator()
+        box.prop(props, "batch_set_location", icon='OBJECT_ORIGIN')
+        if props.batch_set_location:
+            col = box.column(align=True)
+            col.prop(props, "batch_location", text="")
 
         col = box.column(align=True)
         col.scale_y = 1.2
