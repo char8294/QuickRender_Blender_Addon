@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Quick Render",
     "author": "KENJI",
-    "version": (2, 2, 0),
+    "version": (2, 2, 1),
     "blender": (3, 0, 0),
     "location": "3D View > N-panel > Quick Render",
     "description": "Render เฉพาะ Viewport Visible หรือ Selected Objects, สลับ Engine ชั่วคราว, เลือกกล้องหรือ Viewport พร้อมคืนค่าทุกอย่างหลังเรนเดอร์",
@@ -11,10 +11,39 @@ bl_info = {
 import bpy
 import os
 import re
+import json
+import urllib.request
+import urllib.error
 from datetime import datetime
 from bpy.props import StringProperty, EnumProperty, IntProperty, BoolProperty, PointerProperty, FloatVectorProperty
 from bpy.types import Panel, Operator, PropertyGroup
 from mathutils import Vector
+
+# -------------------- GitHub Update Config --------------------
+GITHUB_OWNER = "char8294"
+GITHUB_REPO = "Pack_Blender_Add-on"
+GITHUB_ADDON_FOLDER = "quick_selected_render_engine"
+GITHUB_RAW_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+    f"/main/{GITHUB_ADDON_FOLDER}/__init__.py"
+)
+GITHUB_API_CONTENTS = (
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+    f"/contents/{GITHUB_ADDON_FOLDER}"
+)
+GITHUB_CHANGELOG_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+    f"/main/{GITHUB_ADDON_FOLDER}/CHANGELOG.md"
+)
+
+_update_info = {
+    "checked": False,
+    "has_update": False,
+    "current_version": (0, 0, 0),
+    "latest_version": (0, 0, 0),
+    "error": "",
+    "changelog": [],
+}
 
 # -------------------- Helpers --------------------
 RENDERABLE_TYPES = {'MESH','CURVE','SURFACE','META','FONT','VOLUME','GPENCIL','POINTCLOUD','CURVES'}
@@ -510,6 +539,174 @@ class QVR_OT_batch_render_selected(Operator):
             self.report({'WARNING'}, "ไม่มีไฟล์ถูกเรนเดอร์")
             return {'CANCELLED'}
 
+# -------------------- GitHub Update --------------------
+def _wrap_changelog(content, width=45, max_lines=15):
+    lines = []
+    for source_line in content.splitlines():
+        source_line = source_line.strip()
+        if not source_line:
+            continue
+
+        is_first = True
+        while len(source_line) > width:
+            split_at = source_line.rfind(' ', 0, width)
+            split_at = split_at if split_at > 0 else width
+            chunk = source_line[:split_at]
+            lines.append(chunk if is_first else f"  {chunk}")
+            source_line = source_line[split_at:].strip()
+            is_first = False
+
+        if source_line:
+            lines.append(source_line if is_first else f"  {source_line}")
+
+    return lines[:max_lines]
+
+
+class QVR_OT_check_update(Operator):
+    """ตรวจสอบอัปเดตจาก GitHub"""
+    bl_idname = "quick_render.check_update"
+    bl_label = "Check for Updates"
+
+    def execute(self, context):
+        global _update_info
+        _update_info["error"] = ""
+        _update_info["current_version"] = bl_info["version"]
+        _update_info["changelog"] = []
+
+        try:
+            request = urllib.request.Request(GITHUB_RAW_URL)
+            request.add_header('User-Agent', 'Blender-Addon-Updater')
+            with urllib.request.urlopen(request, timeout=10) as response:
+                content = response.read().decode('utf-8')
+
+            match = re.search(
+                r'"version"\s*:\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)',
+                content,
+            )
+            if not match:
+                _update_info["error"] = "ไม่สามารถอ่านเวอร์ชันจาก GitHub ได้"
+                _update_info["checked"] = True
+                bpy.ops.quick_render.update_popup('INVOKE_DEFAULT')
+                return {'CANCELLED'}
+
+            latest = tuple(int(match.group(index)) for index in range(1, 4))
+            _update_info["latest_version"] = latest
+            _update_info["has_update"] = latest > bl_info["version"]
+            _update_info["checked"] = True
+
+            if _update_info["has_update"]:
+                try:
+                    changelog_request = urllib.request.Request(GITHUB_CHANGELOG_URL)
+                    changelog_request.add_header('User-Agent', 'Blender-Addon-Updater')
+                    with urllib.request.urlopen(changelog_request, timeout=5) as response:
+                        _update_info["changelog"] = _wrap_changelog(
+                            response.read().decode('utf-8')
+                        )
+                except Exception:
+                    pass
+
+        except urllib.error.URLError as error:
+            _update_info["error"] = f"ไม่สามารถเชื่อมต่อ: {error.reason}"
+            _update_info["checked"] = True
+        except Exception as error:
+            _update_info["error"] = str(error)
+            _update_info["checked"] = True
+
+        bpy.ops.quick_render.update_popup('INVOKE_DEFAULT')
+        return {'FINISHED'}
+
+
+class QVR_OT_update_popup(Operator):
+    """แสดงข้อมูลเวอร์ชันและอัปเดต"""
+    bl_idname = "quick_render.update_popup"
+    bl_label = "Quick Render — Update"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        info = _update_info
+
+        if info["error"]:
+            layout.label(text="เกิดข้อผิดพลาด:", icon='ERROR')
+            layout.label(text=info["error"])
+            return
+        if not info["checked"]:
+            layout.label(text="ยังไม่ได้ตรวจสอบ", icon='INFO')
+            return
+
+        current = ".".join(str(value) for value in info["current_version"])
+        latest = ".".join(str(value) for value in info["latest_version"])
+        layout.label(text=f"เวอร์ชันปัจจุบัน:  v{current}", icon='PACKAGE')
+        layout.label(text=f"เวอร์ชันล่าสุด:      v{latest}", icon='WORLD')
+        layout.separator()
+
+        if info["has_update"]:
+            box = layout.box()
+            box.label(text="มีเวอร์ชันใหม่!", icon='INFO')
+            if info["changelog"]:
+                box.separator()
+                box.label(text="What's New:", icon='TEXT')
+                for line in info["changelog"]:
+                    box.label(text=line)
+                box.separator()
+            box.label(text="* เมื่อกด Update Now เสร็จแล้ว", icon='ERROR')
+            box.label(text="  โปรด Restart Blender หรือกด F3 พิมพ์ Reload Scripts")
+            box.operator("quick_render.do_update", text="Update Now", icon='IMPORT')
+        else:
+            layout.label(text="เวอร์ชันล่าสุดแล้ว ✓", icon='CHECKMARK')
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class QVR_OT_do_update(Operator):
+    """ดาวน์โหลดและติดตั้งอัปเดตจาก GitHub"""
+    bl_idname = "quick_render.do_update"
+    bl_label = "Update Add-on"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            request = urllib.request.Request(GITHUB_API_CONTENTS)
+            request.add_header('User-Agent', 'Blender-Addon-Updater')
+            with urllib.request.urlopen(request, timeout=15) as response:
+                files = json.loads(response.read().decode('utf-8'))
+
+            addon_path = os.path.join(
+                bpy.utils.user_resource('SCRIPTS'), "addons", GITHUB_ADDON_FOLDER
+            )
+            os.makedirs(addon_path, exist_ok=True)
+
+            updated_count = 0
+            for file_info in files:
+                if file_info.get("type") != "file":
+                    continue
+                download_url = file_info.get("download_url")
+                if not download_url:
+                    continue
+
+                download_request = urllib.request.Request(download_url)
+                download_request.add_header('User-Agent', 'Blender-Addon-Updater')
+                with urllib.request.urlopen(download_request, timeout=15) as response:
+                    content = response.read()
+
+                with open(os.path.join(addon_path, file_info["name"]), 'wb') as file:
+                    file.write(content)
+                updated_count += 1
+
+            self.report(
+                {'INFO'},
+                f"อัปเดตเสร็จ! ({updated_count} ไฟล์) กรุณา Restart Blender หรือกด F3 พิมพ์ Reload Scripts",
+            )
+        except Exception as error:
+            self.report({'ERROR'}, f"อัปเดตล้มเหลว: {error}")
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+
 # -------------------- UI --------------------
 class QVR_PT_panel(Panel):
     bl_label = "Quick Render"
@@ -528,6 +725,7 @@ class QVR_PT_panel(Panel):
         row.label(text="Engine", icon='PREFERENCES')
         row.separator(factor=1.0)
         row.prop(props, "engine", text="")
+        row.operator("quick_render.check_update", text="", icon='WORLD')
 
         # ── Workbench Settings (collapsible) ──
         if props.engine == 'BLENDER_WORKBENCH':
@@ -627,6 +825,9 @@ classes = (
     QVR_OT_render_save,
     QVR_OT_render_preview,
     QVR_OT_batch_render_selected,
+    QVR_OT_check_update,
+    QVR_OT_update_popup,
+    QVR_OT_do_update,
     QVR_PT_panel,
 )
 
