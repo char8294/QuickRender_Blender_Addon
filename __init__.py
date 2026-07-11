@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Quick Render",
     "author": "KENJI",
-    "version": (2, 2, 1),
+    "version": (2, 2, 2),
     "blender": (3, 0, 0),
     "location": "3D View > N-panel > Quick Render",
     "description": "Render เฉพาะ Viewport Visible หรือ Selected Objects, สลับ Engine ชั่วคราว, เลือกกล้องหรือ Viewport พร้อมคืนค่าทุกอย่างหลังเรนเดอร์",
@@ -19,31 +19,7 @@ from bpy.props import StringProperty, EnumProperty, IntProperty, BoolProperty, P
 from bpy.types import Panel, Operator, PropertyGroup
 from mathutils import Vector
 
-# -------------------- GitHub Update Config --------------------
-GITHUB_OWNER = "char8294"
-GITHUB_REPO = "Pack_Blender_Add-on"
-GITHUB_ADDON_FOLDER = "quick_selected_render_engine"
-GITHUB_RAW_URL = (
-    f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
-    f"/main/{GITHUB_ADDON_FOLDER}/__init__.py"
-)
-GITHUB_API_CONTENTS = (
-    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
-    f"/contents/{GITHUB_ADDON_FOLDER}"
-)
-GITHUB_CHANGELOG_URL = (
-    f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}"
-    f"/main/{GITHUB_ADDON_FOLDER}/CHANGELOG.md"
-)
 
-_update_info = {
-    "checked": False,
-    "has_update": False,
-    "current_version": (0, 0, 0),
-    "latest_version": (0, 0, 0),
-    "error": "",
-    "changelog": [],
-}
 
 # -------------------- Helpers --------------------
 RENDERABLE_TYPES = {'MESH','CURVE','SURFACE','META','FONT','VOLUME','GPENCIL','POINTCLOUD','CURVES'}
@@ -539,171 +515,220 @@ class QVR_OT_batch_render_selected(Operator):
             self.report({'WARNING'}, "ไม่มีไฟล์ถูกเรนเดอร์")
             return {'CANCELLED'}
 
-# -------------------- GitHub Update --------------------
-def _wrap_changelog(content, width=45, max_lines=15):
+# -------------------- GitHub Update Operators --------------------
+
+import tempfile
+import shutil
+from pathlib import Path
+
+try:
+    from . import update_utils
+except ImportError:
+    import update_utils
+
+GITHUB_OWNER = "char8294"
+GITHUB_REPO = "QuickRender_Blender_Addon"
+GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
+GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+GITHUB_TAGS_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/tags"
+GITHUB_ARCHIVE_BASE_URL = f"https://codeload.github.com/{GITHUB_OWNER}/{GITHUB_REPO}/zip/refs/tags/"
+GITHUB_USER_AGENT = "quickrender-Blender-Updater/1.0"
+
+_update_info = {
+    "checked": False,
+    "busy": False,
+    "phase": "",
+    "error": "",
+    "has_update": False,
+    "installed": False,
+    "current_version": bl_info["version"],
+    "latest_version": bl_info["version"],
+    "release_notes": "",
+    "release_url": GITHUB_RELEASES_URL,
+    "metadata": None,
+}
+
+def _format_version(version):
+    return ".".join(str(value) for value in version)
+
+def _wrap_update_notes(content, width=70, max_lines=20):
     lines = []
-    for source_line in content.splitlines():
+    for source_line in (content or "").splitlines():
         source_line = source_line.strip()
         if not source_line:
             continue
-
-        is_first = True
         while len(source_line) > width:
-            split_at = source_line.rfind(' ', 0, width)
+            split_at = source_line.rfind(" ", 0, width)
             split_at = split_at if split_at > 0 else width
-            chunk = source_line[:split_at]
-            lines.append(chunk if is_first else f"  {chunk}")
+            lines.append(source_line[:split_at])
             source_line = source_line[split_at:].strip()
-            is_first = False
-
         if source_line:
-            lines.append(source_line if is_first else f"  {source_line}")
-
+            lines.append(source_line)
     return lines[:max_lines]
 
+def _github_request(url, timeout=15):
+    import urllib.request
+    import json
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": GITHUB_USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+def _download_archive(url, destination, timeout=60):
+    import urllib.request
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/zip", "User-Agent": GITHUB_USER_AGENT},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open(destination, "wb") as output:
+            shutil.copyfileobj(response, output)
+
+def _fetch_update_metadata():
+    return update_utils.fetch_update_metadata(
+        _github_request,
+        release_api_url=GITHUB_LATEST_RELEASE_API,
+        tags_api_url=GITHUB_TAGS_API,
+        archive_base_url=GITHUB_ARCHIVE_BASE_URL,
+        fallback_release_url=GITHUB_RELEASES_URL,
+    )
+
+def _check_for_updates():
+    current_version = update_utils.parse_version(bl_info["version"])
+    try:
+        metadata = _fetch_update_metadata()
+    except Exception as error:
+        _update_info.update(
+            checked=True,
+            busy=False,
+            phase="",
+            error=f"Could not check GitHub for updates: {error}",
+            has_update=False,
+            metadata=None,
+            current_version=current_version,
+            latest_version=current_version,
+        )
+        return
+
+    _update_info.update(
+        checked=True,
+        busy=False,
+        phase="",
+        error="",
+        has_update=metadata.version > current_version,
+        installed=False,
+        current_version=current_version,
+        latest_version=metadata.version,
+        release_notes=metadata.release_notes,
+        release_url=metadata.release_url,
+        metadata=metadata,
+    )
 
 class QVR_OT_check_update(Operator):
-    """ตรวจสอบอัปเดตจาก GitHub"""
     bl_idname = "quick_render.check_update"
     bl_label = "Check for Updates"
-
     def execute(self, context):
-        global _update_info
-        _update_info["error"] = ""
-        _update_info["current_version"] = bl_info["version"]
-        _update_info["changelog"] = []
-
-        try:
-            request = urllib.request.Request(GITHUB_RAW_URL)
-            request.add_header('User-Agent', 'Blender-Addon-Updater')
-            with urllib.request.urlopen(request, timeout=10) as response:
-                content = response.read().decode('utf-8')
-
-            match = re.search(
-                r'"version"\s*:\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)',
-                content,
-            )
-            if not match:
-                _update_info["error"] = "ไม่สามารถอ่านเวอร์ชันจาก GitHub ได้"
-                _update_info["checked"] = True
-                bpy.ops.quick_render.update_popup('INVOKE_DEFAULT')
-                return {'CANCELLED'}
-
-            latest = tuple(int(match.group(index)) for index in range(1, 4))
-            _update_info["latest_version"] = latest
-            _update_info["has_update"] = latest > bl_info["version"]
-            _update_info["checked"] = True
-
-            if _update_info["has_update"]:
-                try:
-                    changelog_request = urllib.request.Request(GITHUB_CHANGELOG_URL)
-                    changelog_request.add_header('User-Agent', 'Blender-Addon-Updater')
-                    with urllib.request.urlopen(changelog_request, timeout=5) as response:
-                        _update_info["changelog"] = _wrap_changelog(
-                            response.read().decode('utf-8')
-                        )
-                except Exception:
-                    pass
-
-        except urllib.error.URLError as error:
-            _update_info["error"] = f"ไม่สามารถเชื่อมต่อ: {error.reason}"
-            _update_info["checked"] = True
-        except Exception as error:
-            _update_info["error"] = str(error)
-            _update_info["checked"] = True
-
+        if _update_info["busy"]:
+            self.report({'WARNING'}, "Update is already running")
+            return {'CANCELLED'}
+        _update_info.update(
+            checked=False, busy=True, phase="Checking GitHub...",
+            error="", installed=False, metadata=None,
+        )
+        _check_for_updates()
         bpy.ops.quick_render.update_popup('INVOKE_DEFAULT')
         return {'FINISHED'}
 
-
 class QVR_OT_update_popup(Operator):
-    """แสดงข้อมูลเวอร์ชันและอัปเดต"""
     bl_idname = "quick_render.update_popup"
     bl_label = "Quick Render — Update"
-
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=300)
-
+        return context.window_manager.invoke_props_dialog(self, width=480)
     def draw(self, context):
         layout = self.layout
         info = _update_info
-
+        if info["busy"]:
+            layout.label(text=info["phase"] or "Working...", icon='TIME')
+            return
+        if info["installed"]:
+            layout.label(text="Update installed successfully", icon='CHECKMARK')
+            layout.label(text="Use F3 > Reload Scripts or restart Blender.")
+            return
         if info["error"]:
-            layout.label(text="เกิดข้อผิดพลาด:", icon='ERROR')
-            layout.label(text=info["error"])
+            layout.label(text="Update check failed", icon='ERROR')
+            for line in _wrap_update_notes(info["error"], width=65, max_lines=8):
+                layout.label(text=line)
+            operator = layout.operator("wm.url_open", text="Open GitHub Releases", icon='URL')
+            operator.url = GITHUB_RELEASES_URL
             return
         if not info["checked"]:
-            layout.label(text="ยังไม่ได้ตรวจสอบ", icon='INFO')
+            layout.label(text="No update check has been performed yet", icon='INFO')
             return
-
-        current = ".".join(str(value) for value in info["current_version"])
-        latest = ".".join(str(value) for value in info["latest_version"])
-        layout.label(text=f"เวอร์ชันปัจจุบัน:  v{current}", icon='PACKAGE')
-        layout.label(text=f"เวอร์ชันล่าสุด:      v{latest}", icon='WORLD')
+        layout.label(text=f"Current version: v{_format_version(info['current_version'])}", icon='PACKAGE')
+        layout.label(text=f"Latest version: v{_format_version(info['latest_version'])}", icon='WORLD')
         layout.separator()
-
         if info["has_update"]:
             box = layout.box()
-            box.label(text="มีเวอร์ชันใหม่!", icon='INFO')
-            if info["changelog"]:
-                box.separator()
-                box.label(text="What's New:", icon='TEXT')
-                for line in info["changelog"]:
+            box.label(text="A new version is available", icon='INFO')
+            if info["release_notes"]:
+                box.label(text="Release notes:", icon='TEXT')
+                for line in _wrap_update_notes(info["release_notes"]):
                     box.label(text=line)
-                box.separator()
-            box.label(text="* เมื่อกด Update Now เสร็จแล้ว", icon='ERROR')
-            box.label(text="  โปรด Restart Blender หรือกด F3 พิมพ์ Reload Scripts")
+            box.separator()
+            box.label(text="Blender will need Reload Scripts or a restart after install.")
             box.operator("quick_render.do_update", text="Update Now", icon='IMPORT')
         else:
-            layout.label(text="เวอร์ชันล่าสุดแล้ว ✓", icon='CHECKMARK')
-
+            layout.label(text="Up to date", icon='CHECKMARK')
     def execute(self, context):
         return {'FINISHED'}
 
-
 class QVR_OT_do_update(Operator):
-    """ดาวน์โหลดและติดตั้งอัปเดตจาก GitHub"""
     bl_idname = "quick_render.do_update"
     bl_label = "Update Add-on"
-    bl_options = {'REGISTER'}
-
     def execute(self, context):
-        try:
-            request = urllib.request.Request(GITHUB_API_CONTENTS)
-            request.add_header('User-Agent', 'Blender-Addon-Updater')
-            with urllib.request.urlopen(request, timeout=15) as response:
-                files = json.loads(response.read().decode('utf-8'))
-
-            addon_path = os.path.join(
-                bpy.utils.user_resource('SCRIPTS'), "addons", GITHUB_ADDON_FOLDER
-            )
-            os.makedirs(addon_path, exist_ok=True)
-
-            updated_count = 0
-            for file_info in files:
-                if file_info.get("type") != "file":
-                    continue
-                download_url = file_info.get("download_url")
-                if not download_url:
-                    continue
-
-                download_request = urllib.request.Request(download_url)
-                download_request.add_header('User-Agent', 'Blender-Addon-Updater')
-                with urllib.request.urlopen(download_request, timeout=15) as response:
-                    content = response.read()
-
-                with open(os.path.join(addon_path, file_info["name"]), 'wb') as file:
-                    file.write(content)
-                updated_count += 1
-
-            self.report(
-                {'INFO'},
-                f"อัปเดตเสร็จ! ({updated_count} ไฟล์) กรุณา Restart Blender หรือกด F3 พิมพ์ Reload Scripts",
-            )
-        except Exception as error:
-            self.report({'ERROR'}, f"อัปเดตล้มเหลว: {error}")
+        metadata = _update_info.get("metadata")
+        if _update_info["busy"] or not metadata or not _update_info["has_update"]:
+            self.report({'WARNING'}, "No installable update is selected")
             return {'CANCELLED'}
-
+        work_dir = Path(tempfile.mkdtemp(prefix="quickrender-update-"))
+        keep_work_dir = False
+        _update_info.update(busy=True, phase="Downloading update archive...", error="")
+        try:
+            archive_path = work_dir / "update.zip"
+            extraction_dir = work_dir / "extract"
+            self.report({'INFO'}, "Downloading update archive...")
+            _download_archive(metadata.archive_url, archive_path)
+            _update_info["phase"] = "Extracting and validating update..."
+            self.report({'INFO'}, _update_info["phase"])
+            package_root = update_utils.extract_and_validate_archive(
+                archive_path, extraction_dir, expected_version=metadata.version,
+            )
+            target_dir = Path(__file__).resolve().parent
+            if not target_dir.is_dir():
+                raise RuntimeError("The running add-on is not installed in a writable directory")
+            if (target_dir / ".git").exists():
+                raise RuntimeError("Automatic update is disabled for a Git working tree; install the add-on in Blender first")
+            _update_info["phase"] = "Installing update..."
+            self.report({'INFO'}, _update_info["phase"])
+            update_utils.install_package(package_root, target_dir, work_dir)
+            _update_info.update(busy=False, phase="", error="", installed=True, has_update=False)
+            self.report({'INFO'}, "Update installed; reload scripts or restart Blender")
+        except update_utils.InstallTransactionError as error:
+            keep_work_dir = bool(error.backup_path)
+            message = str(error)
+            if error.backup_path:
+                message += f" Backup preserved at: {error.backup_path}"
+            _update_info.update(busy=False, phase="", error=message, installed=False)
+        except Exception as error:
+            _update_info.update(busy=False, phase="", error=f"Update installation failed: {error}", installed=False)
+        finally:
+            if not keep_work_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
         return {'FINISHED'}
 
 
