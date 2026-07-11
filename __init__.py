@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Quick Render",
     "author": "KENJI",
-    "version": (2, 2, 2),
+    "version": (2, 2, 3),
     "blender": (3, 0, 0),
     "location": "3D View > N-panel > Quick Render",
     "description": "Render เฉพาะ Viewport Visible หรือ Selected Objects, สลับ Engine ชั่วคราว, เลือกกล้องหรือ Viewport พร้อมคืนค่าทุกอย่างหลังเรนเดอร์",
